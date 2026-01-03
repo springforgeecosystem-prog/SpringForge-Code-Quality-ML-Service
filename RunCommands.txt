@@ -1,0 +1,23 @@
+Option 1: Manual Testing in Postman
+
+Copy any payload from the JSON artifact
+Paste into Postman body (raw JSON)
+POST to http://127.0.0.1:8081/predict-antipattern
+Compare result with expected value
+
+Option 2: Automated Testing
+
+Save the Python script as test_antipatterns.py
+Make sure your FastAPI server is running
+Run: python test_antipatterns.py
+Check test_results.txt for detailed report
+
+Make sure your FastAPI server is running in one terminal:
+uvicorn app.main:app --reload --port 8081
+
+Run the test script in another terminal:
+# Activate venv if not already activated
+venv\Scripts\activate
+
+# Run the tests
+python test_antipatterns.py
