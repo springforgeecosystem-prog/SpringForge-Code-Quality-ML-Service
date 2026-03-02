@@ -21,3 +21,4 @@ venv\Scripts\activate
 
 # Run the tests
 python test_antipatterns.py
+python test_quality_score.py

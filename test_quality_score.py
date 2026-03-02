@@ -9,7 +9,7 @@ Run with:  python test_quality_score.py
 import requests
 import json
 
-BASE = "http://localhost:8000"
+BASE = "http://localhost:8081"
 
 # ── Reusable sample files ─────────────────────────────────────────
 
