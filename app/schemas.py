@@ -1,10 +1,11 @@
 """
-# app/schemas.py 
+app/schemas.py  — COMPLETE FILE (replace your existing schemas.py)
 ──────────────────────────────────────────────────────────────────
 Pydantic schemas for the SpringForge ML Service.
-Supports both:
-  • Anti-pattern classification  
-  • Quality score regression      
+Supports:
+  • Anti-pattern classification
+  • Quality score regression
+  • AI-powered fix suggestions (NEW)
 ──────────────────────────────────────────────────────────────────
 """
 
@@ -56,7 +57,7 @@ class FileAnalysisInput(BaseModel):
 
 
 # ════════════════════════════════════════════════════════════════
-# ANTI-PATTERN MODEL — response schemas 
+# ANTI-PATTERN MODEL — response schemas
 # ════════════════════════════════════════════════════════════════
 
 class AntiPatternDetail(BaseModel):
@@ -80,16 +81,12 @@ class EnhancedPredictionResult(BaseModel):
 
 
 # ════════════════════════════════════════════════════════════════
-# QUALITY SCORE MODEL — request / response schemas  
+# QUALITY SCORE MODEL — request / response schemas
 # ════════════════════════════════════════════════════════════════
 
 class QualityScoreInput(BaseModel):
-    """
-    Input for quality score prediction for a single file.
-    Identical fields to AntiPatternInput plus 'layer'.
-    """
-    layer                   : str   = Field(default="controller",
-                                            description="Spring layer: controller / service / repository / entity / adapter / port")
+    """Input for quality score prediction for a single file."""
+    layer                   : str   = Field(default="controller")
     loc                     : float = 0
     methods                 : float = 0
     classes                 : float = 0
@@ -127,8 +124,7 @@ class FileQualityResult(BaseModel):
     quality_label   : str
     quality_emoji   : str
     quality_display : str
-    issues          : List[str] = Field(default_factory=list,
-                                        description="Human-readable issue list for this file")
+    issues          : List[str] = Field(default_factory=list)
 
 
 class LayerQualitySummary(BaseModel):
@@ -143,77 +139,87 @@ class LayerQualitySummary(BaseModel):
 
 
 class ProjectQualityResult(BaseModel):
-    """
-    Full project-level quality analysis result.
-    Returned by POST /analyze-quality.
-    Designed to drive the IntelliJ IDEA report panel.
-    """
+    """Full project-level quality analysis result."""
     architecture_pattern  : str
     total_files_analyzed  : int
     analysis_date         : str
-
-    # Overall score
     overall_score         : float
     overall_label         : str
     overall_emoji         : str
     overall_display       : str
-
-    # Per-layer breakdown
     layer_scores          : List[LayerQualitySummary]
-
-    # Actionable file list (worst files first)
     files                 : List[FileQualityResult]
-
-    # Code health metrics
     avg_loc               : float
     avg_imports           : float
     avg_cross_layer_deps  : float
     files_with_violations : int
     total_issues_found    : int
-
-    # Improvement projection
     projected_score_after_fixes : float
-    summary                     : str
+    summary               : str
 
 
 # ════════════════════════════════════════════════════════════════
-# COMBINED ANALYSIS — both models together  
+# COMBINED ANALYSIS — both models together
 # ════════════════════════════════════════════════════════════════
 
 class CombinedAnalysisResult(BaseModel):
-    """
-    Full combined output: anti-pattern violations + quality scores.
-    Returned by POST /analyze-project-full.
-    This is the payload that drives the IntelliJ "Analyze Code Quality"
-    report panel described in the project brief.
-    """
-    # ── Project metadata ──────────────────────────────────────────
+    """Full combined output: anti-pattern violations + quality scores."""
     architecture_pattern  : str
     total_files_analyzed  : int
     analysis_date         : str
-
-    # ── Quality Score section ──────────────────────────────────────
     overall_score         : float
     overall_label         : str
     overall_display       : str
     layer_scores          : List[LayerQualitySummary]
-
-    # ── Anti-pattern section ───────────────────────────────────────
     total_violations      : int
     anti_patterns         : List[AntiPatternDetail]
     clean_files           : List[str]
-
-    # ── Per-file details ───────────────────────────────────────────
     files                 : List[FileQualityResult]
-
-    # ── Code health metrics ────────────────────────────────────────
     avg_loc               : float
     avg_cross_layer_deps  : float
     files_with_violations : int
-
-    # ── Improvement projection ─────────────────────────────────────
     projected_score_after_fixes : float
-
-    # ── Summaries ──────────────────────────────────────────────────
     quality_summary       : str
     violation_summary     : str
+
+
+# ════════════════════════════════════════════════════════════════
+# AI-POWERED FIX SUGGESTIONS  (NEW — Gemini integration)
+# ════════════════════════════════════════════════════════════════
+
+class SingleFixRequest(BaseModel):
+    """Request body for POST /generate-fix (one anti-pattern)."""
+    anti_pattern         : str
+    files                : List[str] = []
+    architecture_pattern : str       = "layered"
+    affected_layer       : str       = "unknown"
+    severity             : str       = "MEDIUM"
+    description          : str       = ""
+
+
+class FixRequest(BaseModel):
+    """Request body for POST /generate-fixes (full project)."""
+    anti_patterns        : List[AntiPatternDetail]
+    architecture_pattern : str = "layered"
+
+
+class FixSuggestion(BaseModel):
+    """One AI-powered fix suggestion for a single anti-pattern."""
+    anti_pattern  : str
+    layer         : str
+    severity      : str
+    impact_points : int  = Field(description="Negative = quality score impact")
+    problem       : str  = Field(description="Short problem description")
+    recommendation: str  = Field(description="Static best-practice recommendation text")
+    files         : List[str]
+    before_code   : str  = Field(description="Problematic code example")
+    after_code    : str  = Field(description="Fixed code example")
+    gemini_fix    : str  = Field(description="AI-generated, file-specific fix text")
+    ai_powered    : bool = Field(description="True if Gemini responded successfully")
+
+
+class ProjectFixResult(BaseModel):
+    """Response for POST /generate-fixes (full project)."""
+    architecture_pattern : str
+    total_fixes          : int
+    suggestions          : List[FixSuggestion]

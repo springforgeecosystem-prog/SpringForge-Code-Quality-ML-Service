@@ -1,7 +1,7 @@
 """
-main.py
+app/main.py  — COMPLETE FILE (replace your existing main.py)
 ──────────────────────────────────────────────────────────────────
-SpringForge AI-Driven Code Quality ML Service
+SpringForge AI-Driven Code Quality ML Service  v2.1
 FastAPI application exposing:
 
   EXISTING (Anti-Pattern Classification):
@@ -9,13 +9,16 @@ FastAPI application exposing:
     POST /predict-antipattern       Single file anti-pattern prediction
     POST /analyze-project           Multi-file anti-pattern analysis
 
-  NEW (Quality Score Regression):
+  EXISTING (Quality Score Regression):
     POST /predict-quality-score     Single file quality score prediction
     POST /analyze-quality           Multi-file quality score analysis
 
-  NEW (Combined — drives IntelliJ plugin):
+  EXISTING (Combined):
     POST /analyze-project-full      Combined anti-pattern + quality score
-                                    for all files in a project
+
+  NEW (AI Fix Suggestions — Gemini):
+    POST /generate-fix              Fix suggestion for one anti-pattern
+    POST /generate-fixes            Fix suggestions for full project
 ──────────────────────────────────────────────────────────────────
 """
 
@@ -35,82 +38,66 @@ from app.schemas import (
     CombinedAnalysisResult,
     # shared
     FileFeatures, AntiPatternDetail,
+    # NEW — fix suggestions
+    SingleFixRequest, FixRequest, FixSuggestion, ProjectFixResult,
 )
 from app.model_loader         import AntiPatternModel
 from app.quality_model_loader import QualityScoreModel
+from app.gemini_fix_service   import generate_project_fixes, generate_fix_suggestion   # NEW
 
-# ── Startup: load both models once ────────────────────────────────
+# ── Startup ────────────────────────────────────────────────────────────────
 app = FastAPI(
     title       = "SpringForge AI-Driven Code Quality ML Service",
-    description = "Anti-Pattern Classification + Quality Score Prediction",
-    version     = "2.0.0",
+    description = "Anti-Pattern Classification + Quality Score + Gemini Fix Suggestions",
+    version     = "2.1.0",
 )
 
-antipattern_model  = AntiPatternModel()
-quality_model      = QualityScoreModel()
+antipattern_model = AntiPatternModel()
+quality_model     = QualityScoreModel()
 
 
+# ── Health check ───────────────────────────────────────────────────────────
 @app.get("/")
 def home():
     return {
         "status"  : "SpringForge ML Service Running",
-        "version" : "2.0.0",
-        "models"  : ["Anti-Pattern Classifier", "Quality Score Regressor"],
+        "version" : "2.1.0",
+        "models"  : [
+            "Anti-Pattern Classifier",
+            "Quality Score Regressor",
+            "Gemini Fix Suggestion Generator",   # NEW
+        ],
     }
 
 
+# ─────────────────────────────────────────────────────────────────
+# ANTI-PATTERN ENDPOINTS (unchanged)
+# ─────────────────────────────────────────────────────────────────
+
 @app.post("/predict-antipattern")
 def predict_antipattern(input_data: AntiPatternInput):
-    """Single file anti-pattern prediction (backward compatible)."""
-    features    = input_data.dict()
-    prediction  = antipattern_model.predict(features)
+    features   = input_data.dict()
+    prediction = antipattern_model.predict(features)
     return {"anti_pattern": prediction}
 
 
 @app.post("/analyze-project", response_model=EnhancedPredictionResult)
 def analyze_project(input_data: FileAnalysisInput):
-    """
-    Analyze multiple files and return detailed results with:
-    - Anti-pattern types
-    - Severity levels
-    - Affected layers
-    - Confidence scores
-    - File-level details
-    """
     return antipattern_model.analyze_project(input_data.files)
 
 
 # ─────────────────────────────────────────────────────────────────
-# QUALITY SCORE ENDPOINTS
+# QUALITY SCORE ENDPOINTS (unchanged)
 # ─────────────────────────────────────────────────────────────────
 
 @app.post("/predict-quality-score", response_model=QualityScoreResult)
 def predict_quality_score(input_data: QualityScoreInput):
-    """
-    Predict quality score (0–100) for a single Java file.
-
-    Example request body:
-    {
-      "layer": "controller",
-      "loc": 250, "methods": 8, "classes": 1, "avg_cc": 3.0,
-      "imports": 15, "annotations": 8,
-      "controller_deps": 0, "service_deps": 2, "repository_deps": 1,
-      "adapter_deps": 0, "port_deps": 0, "total_cross_layer_deps": 3,
-      "has_business_logic": true, "has_data_access": false,
-      "has_http_handling": true, "has_validation": false,
-      "has_transaction": false, "violates_layer_separation": true
-    }
-    """
     result = quality_model.predict(input_data.dict())
     return QualityScoreResult(**result)
 
 
 @app.post("/analyze-quality", response_model=ProjectQualityResult)
 def analyze_quality(input_data: FileAnalysisInput):
-    """
-    Quality score analysis for all files in a project.
-    Returns per-file scores, per-layer summaries, and overall project score.
-    """
     files = input_data.files
     if not files:
         raise HTTPException(status_code=400, detail="No files provided")
@@ -118,24 +105,19 @@ def analyze_quality(input_data: FileAnalysisInput):
     architecture = files[0].architecture_pattern
     now          = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    # ── Score every file ──────────────────────────────────────────
     file_results: List[FileQualityResult] = []
     for f in files:
-        metrics  = f.dict()
-        qs       = quality_model.predict(metrics)
-        issues   = _derive_issues(metrics)
+        metrics = f.dict()
+        qs      = quality_model.predict(metrics)
+        issues  = _derive_issues(metrics)
         file_results.append(FileQualityResult(
-            file_name       = f.file_name,
-            file_path       = f.file_path,
-            layer           = f.layer or "unknown",
-            quality_score   = qs['quality_score'],
-            quality_label   = qs['quality_label'],
-            quality_emoji   = qs['quality_emoji'],
-            quality_display = qs['quality_display'],
-            issues          = issues,
+            file_name=f.file_name, file_path=f.file_path,
+            layer=f.layer or "unknown",
+            quality_score=qs['quality_score'], quality_label=qs['quality_label'],
+            quality_emoji=qs['quality_emoji'], quality_display=qs['quality_display'],
+            issues=issues,
         ))
 
-    # ── Per-layer aggregation ─────────────────────────────────────
     layer_map: dict = defaultdict(list)
     for fr in file_results:
         layer_map[fr.layer].append(fr)
@@ -145,73 +127,42 @@ def analyze_quality(input_data: FileAnalysisInput):
         mean_score = sum(f.quality_score for f in layer_files) / len(layer_files)
         label, emoji = quality_model._score_label(mean_score)
         layer_scores.append(LayerQualitySummary(
-            layer           = layer_name,
-            file_count      = len(layer_files),
-            mean_score      = round(mean_score, 1),
-            quality_label   = label,
-            quality_emoji   = emoji,
-            quality_display = f"{emoji} {label} ({mean_score:.0f}/100)",
-            files           = sorted(layer_files, key=lambda x: x.quality_score),
+            layer=layer_name, file_count=len(layer_files),
+            mean_score=round(mean_score, 1), quality_label=label, quality_emoji=emoji,
+            quality_display=f"{emoji} {label} ({mean_score:.0f}/100)", files=layer_files,
         ))
     layer_scores.sort(key=lambda x: x.mean_score, reverse=True)
 
-    # ── Overall score ─────────────────────────────────────────────
     overall = sum(f.quality_score for f in file_results) / len(file_results)
     o_label, o_emoji = quality_model._score_label(overall)
-
-    # ── Code health metrics ───────────────────────────────────────
     total_issues   = sum(len(f.issues) for f in file_results)
-    files_violated = sum(1 for f in file_results if len(f.issues) > 0)
+    files_violated = sum(1 for f in file_results if f.issues)
     avg_loc        = sum(f.loc   for f in files) / len(files)
     avg_deps       = sum(f.total_cross_layer_deps for f in files) / len(files)
     avg_imports    = sum(f.imports for f in files) / len(files)
-
-    # ── Projected score (rough: assume high-severity issues fixed) ─
-    projected = min(100.0, overall + total_issues * 1.5)
-
-    summary = _build_quality_summary(overall, o_label, layer_scores,
-                                     total_issues, files_violated)
+    projected      = min(100.0, overall + total_issues * 1.5)
 
     return ProjectQualityResult(
-        architecture_pattern        = architecture,
-        total_files_analyzed        = len(files),
-        analysis_date               = now,
-        overall_score               = round(overall, 1),
-        overall_label               = o_label,
-        overall_emoji               = o_emoji,
-        overall_display             = f"{o_emoji} {o_label} ({overall:.0f}/100)",
-        layer_scores                = layer_scores,
-        files                       = sorted(file_results,
-                                             key=lambda x: x.quality_score),
-        avg_loc                     = round(avg_loc, 1),
-        avg_imports                 = round(avg_imports, 1),
-        avg_cross_layer_deps        = round(avg_deps, 2),
-        files_with_violations       = files_violated,
-        total_issues_found          = total_issues,
-        projected_score_after_fixes = round(projected, 1),
-        summary                     = summary,
+        architecture_pattern=architecture, total_files_analyzed=len(files),
+        analysis_date=now, overall_score=round(overall, 1),
+        overall_label=o_label, overall_emoji=o_emoji,
+        overall_display=f"{o_emoji} {o_label} ({overall:.0f}/100)",
+        layer_scores=layer_scores,
+        files=sorted(file_results, key=lambda x: x.quality_score),
+        avg_loc=round(avg_loc, 1), avg_imports=round(avg_imports, 1),
+        avg_cross_layer_deps=round(avg_deps, 2),
+        files_with_violations=files_violated, total_issues_found=total_issues,
+        projected_score_after_fixes=round(projected, 1),
+        summary=_build_quality_summary(overall, o_label, layer_scores, total_issues, files_violated),
     )
 
 
 # ─────────────────────────────────────────────────────────────────
-# NEW: COMBINED ENDPOINT  (drives IntelliJ "Analyze Code Quality")
+# COMBINED ENDPOINT (unchanged)
 # ─────────────────────────────────────────────────────────────────
 
 @app.post("/analyze-project-full", response_model=CombinedAnalysisResult)
 def analyze_project_full(input_data: FileAnalysisInput):
-    """
-    MAIN ENDPOINT for the IntelliJ plugin "Analyze Code Quality" button.
-
-    Runs BOTH models on every file and returns:
-      • Quality score dashboard (overall + per-layer)
-      • Anti-pattern violations (sorted by severity)
-      • Per-file details with issues
-      • Code health metrics
-      • Improvement projection
-
-    The IntelliJ plugin calls this single endpoint and renders the
-    full SPRINGFORGE CODE QUALITY ANALYSIS REPORT from the response.
-    """
     files = input_data.files
     if not files:
         raise HTTPException(status_code=400, detail="No files provided")
@@ -219,28 +170,21 @@ def analyze_project_full(input_data: FileAnalysisInput):
     architecture = files[0].architecture_pattern
     now          = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    # ── 1. Run Quality Score model on every file ──────────────────
     file_results: List[FileQualityResult] = []
     for f in files:
         metrics = f.dict()
         qs      = quality_model.predict(metrics)
         issues  = _derive_issues(metrics)
         file_results.append(FileQualityResult(
-            file_name       = f.file_name,
-            file_path       = f.file_path,
-            layer           = f.layer or "unknown",
-            quality_score   = qs['quality_score'],
-            quality_label   = qs['quality_label'],
-            quality_emoji   = qs['quality_emoji'],
-            quality_display = qs['quality_display'],
-            issues          = issues,
+            file_name=f.file_name, file_path=f.file_path,
+            layer=f.layer or "unknown",
+            quality_score=qs['quality_score'], quality_label=qs['quality_label'],
+            quality_emoji=qs['quality_emoji'], quality_display=qs['quality_display'],
+            issues=issues,
         ))
 
-    # ── 2. Run Anti-Pattern model on every file ───────────────────
-    ap_violations: dict = defaultdict(
-        lambda: {'files': [], 'layers': set(), 'confidences': []})
+    ap_violations: dict = defaultdict(lambda: {'files': [], 'layers': set(), 'confidences': []})
     clean_files: List[str] = []
-
     for f in files:
         features     = f.dict()
         ap, conf     = antipattern_model.predict_with_confidence(features)
@@ -252,7 +196,6 @@ def analyze_project_full(input_data: FileAnalysisInput):
             ap_violations[ap]['layers'].add(layer)
             ap_violations[ap]['confidences'].append(conf)
 
-    # Build AntiPatternDetail list
     ap_details: List[AntiPatternDetail] = []
     for ap, data in ap_violations.items():
         info     = antipattern_model.ANTI_PATTERN_INFO.get(ap, {
@@ -260,18 +203,14 @@ def analyze_project_full(input_data: FileAnalysisInput):
             "recommendation": "Review manually"})
         avg_conf = sum(data['confidences']) / len(data['confidences'])
         ap_details.append(AntiPatternDetail(
-            type           = ap,
-            severity       = info['severity'],
-            affected_layer = ", ".join(sorted(data['layers'])),
-            confidence     = round(avg_conf, 2),
-            files          = data['files'],
-            description    = info['description'],
-            recommendation = info['recommendation'],
+            type=ap, severity=info['severity'],
+            affected_layer=", ".join(sorted(data['layers'])),
+            confidence=round(avg_conf, 2), files=data['files'],
+            description=info['description'], recommendation=info['recommendation'],
         ))
     severity_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "NONE": 4}
     ap_details.sort(key=lambda x: severity_order.get(x.severity, 5))
 
-    # ── 3. Aggregate quality scores per layer ─────────────────────
     layer_map: dict = defaultdict(list)
     for fr in file_results:
         layer_map[fr.layer].append(fr)
@@ -281,21 +220,15 @@ def analyze_project_full(input_data: FileAnalysisInput):
         mean_score = sum(f.quality_score for f in lfiles) / len(lfiles)
         label, emoji = quality_model._score_label(mean_score)
         layer_scores.append(LayerQualitySummary(
-            layer           = layer_name,
-            file_count      = len(lfiles),
-            mean_score      = round(mean_score, 1),
-            quality_label   = label,
-            quality_emoji   = emoji,
-            quality_display = f"{emoji} {label} ({mean_score:.0f}/100)",
-            files           = sorted(lfiles, key=lambda x: x.quality_score),
+            layer=layer_name, file_count=len(lfiles),
+            mean_score=round(mean_score, 1), quality_label=label, quality_emoji=emoji,
+            quality_display=f"{emoji} {label} ({mean_score:.0f}/100)",
+            files=sorted(lfiles, key=lambda x: x.quality_score),
         ))
     layer_scores.sort(key=lambda x: x.mean_score, reverse=True)
 
-    # ── 4. Overall score ──────────────────────────────────────────
     overall = sum(f.quality_score for f in file_results) / len(file_results)
     o_label, o_emoji = quality_model._score_label(overall)
-
-    # ── 5. Code health metrics ────────────────────────────────────
     total_issues   = sum(len(f.issues) for f in file_results)
     files_violated = sum(1 for f in file_results if f.issues)
     total_viol     = sum(len(d['files']) for d in ap_violations.values())
@@ -304,42 +237,83 @@ def analyze_project_full(input_data: FileAnalysisInput):
     projected      = min(100.0, overall + total_issues * 1.5)
 
     return CombinedAnalysisResult(
-        architecture_pattern        = architecture,
-        total_files_analyzed        = len(files),
-        analysis_date               = now,
-        overall_score               = round(overall, 1),
-        overall_label               = o_label,
-        overall_display             = f"{o_emoji} {o_label} ({overall:.0f}/100)",
-        layer_scores                = layer_scores,
-        total_violations            = total_viol,
-        anti_patterns               = ap_details,
-        clean_files                 = clean_files,
-        files                       = sorted(file_results,
-                                             key=lambda x: x.quality_score),
-        avg_loc                     = round(avg_loc, 1),
-        avg_cross_layer_deps        = round(avg_deps, 2),
-        files_with_violations       = files_violated,
-        projected_score_after_fixes = round(projected, 1),
-        quality_summary             = _build_quality_summary(
-                                          overall, o_label, layer_scores,
-                                          total_issues, files_violated),
-        violation_summary           = _build_violation_summary(
-                                          total_viol, len(files), ap_details),
+        architecture_pattern=architecture, total_files_analyzed=len(files),
+        analysis_date=now, overall_score=round(overall, 1),
+        overall_label=o_label, overall_display=f"{o_emoji} {o_label} ({overall:.0f}/100)",
+        layer_scores=layer_scores, total_violations=total_viol,
+        anti_patterns=ap_details, clean_files=clean_files,
+        files=sorted(file_results, key=lambda x: x.quality_score),
+        avg_loc=round(avg_loc, 1), avg_cross_layer_deps=round(avg_deps, 2),
+        files_with_violations=files_violated,
+        projected_score_after_fixes=round(projected, 1),
+        quality_summary=_build_quality_summary(overall, o_label, layer_scores, total_issues, files_violated),
+        violation_summary=_build_violation_summary(total_viol, len(files), ap_details),
     )
 
 
 # ─────────────────────────────────────────────────────────────────
-# HELPERS
+# NEW: AI FIX SUGGESTION ENDPOINTS  (Gemini)
+# ─────────────────────────────────────────────────────────────────
+
+@app.post("/generate-fix", response_model=FixSuggestion)
+def generate_fix(input_data: SingleFixRequest):
+    """
+    Generate an AI-powered fix suggestion for ONE anti-pattern.
+    Called when the user clicks 'Get AI Fix' on a specific violation.
+
+    Example request:
+    {
+      "anti_pattern": "no_validation",
+      "files": ["UserController.java", "OrderController.java"],
+      "architecture_pattern": "layered",
+      "affected_layer": "Controller",
+      "severity": "MEDIUM",
+      "description": "Missing @Valid on @RequestBody parameters"
+    }
+    """
+    result = generate_fix_suggestion(
+        anti_pattern  = input_data.anti_pattern,
+        files         = input_data.files,
+        architecture  = input_data.architecture_pattern,
+        layer         = input_data.affected_layer,
+        severity      = input_data.severity,
+        description   = input_data.description,
+        use_gemini    = True,
+    )
+    return FixSuggestion(**result)
+
+
+@app.post("/generate-fixes", response_model=ProjectFixResult)
+def generate_fixes(input_data: FixRequest):
+    """
+    Generate AI-powered fix suggestions for ALL violations in a project.
+    Called after /analyze-project-full when the user wants detailed fixes.
+
+    The plugin sends the anti_patterns list from CombinedAnalysisResult
+    and receives one FixSuggestion per violation, each with:
+      - Static before/after code examples
+      - Gemini-generated, file-specific fix text
+      - Impact score estimate
+    """
+    suggestions_raw = generate_project_fixes(
+        anti_patterns = [ap.dict() for ap in input_data.anti_patterns],
+        architecture  = input_data.architecture_pattern,
+    )
+    suggestions = [FixSuggestion(**s) for s in suggestions_raw]
+    return ProjectFixResult(
+        architecture_pattern = input_data.architecture_pattern,
+        total_fixes          = len(suggestions),
+        suggestions          = suggestions,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────
+# HELPERS  (unchanged)
 # ─────────────────────────────────────────────────────────────────
 
 def _derive_issues(metrics: dict) -> List[str]:
-    """
-    Convert raw file metrics into human-readable issue strings.
-    These are used in the per-file detail table in the IntelliJ report.
-    """
     issues = []
     layer  = str(metrics.get('layer', '')).lower()
-
     if metrics.get('violates_layer_separation'):
         issues.append("Layer separation violation")
     if layer == 'controller':
@@ -365,18 +339,13 @@ def _derive_issues(metrics: dict) -> List[str]:
         issues.append(f"High import count ({int(metrics['imports'])})")
     if metrics.get('loc', 0) > 300:
         issues.append(f"Large file ({int(metrics['loc'])} LOC)")
-
     return issues
 
 
-def _build_quality_summary(overall: float, label: str,
-                            layer_scores: List[LayerQualitySummary],
-                            total_issues: int, files_violated: int) -> str:
-    worst  = layer_scores[-1] if layer_scores else None
-    best   = layer_scores[0]  if layer_scores else None
-    lines  = [
-        f"Overall project quality: {label} ({overall:.0f}/100)",
-    ]
+def _build_quality_summary(overall, label, layer_scores, total_issues, files_violated):
+    worst = layer_scores[-1] if layer_scores else None
+    best  = layer_scores[0]  if layer_scores else None
+    lines = [f"Overall project quality: {label} ({overall:.0f}/100)"]
     if best:
         lines.append(f"✅ Strongest layer: {best.layer} ({best.mean_score:.0f}/100 {best.quality_emoji})")
     if worst and worst != best:
@@ -385,8 +354,7 @@ def _build_quality_summary(overall: float, label: str,
     return "\n".join(lines)
 
 
-def _build_violation_summary(total: int, file_count: int,
-                              details: List[AntiPatternDetail]) -> str:
+def _build_violation_summary(total, file_count, details):
     if total == 0:
         return f"✅ No architectural violations detected in {file_count} files"
     critical = sum(1 for d in details if d.severity == "CRITICAL")
