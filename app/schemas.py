@@ -1,5 +1,5 @@
 """
-app/schemas.py  — COMPLETE FILE (replace your existing schemas.py)
+app/schemas.py
 ──────────────────────────────────────────────────────────────────
 Pydantic schemas for the SpringForge ML Service.
 Supports:
@@ -184,7 +184,7 @@ class CombinedAnalysisResult(BaseModel):
 
 
 # ════════════════════════════════════════════════════════════════
-# AI-POWERED FIX SUGGESTIONS  (NEW — Gemini integration)
+# AI-POWERED FIX SUGGESTIONS  (Gemini integration)
 # ════════════════════════════════════════════════════════════════
 
 class SingleFixRequest(BaseModel):

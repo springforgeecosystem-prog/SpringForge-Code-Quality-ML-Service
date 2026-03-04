@@ -1,18 +1,14 @@
 """
-app/gemini_fix_service.py  — FIXED VERSION
+app/gemini_fix_service.py  
 ─────────────────────────────────────────────────────────────────────────────
 Gemini-powered recommendation and fix suggestion generator.
-
-Changes vs previous version:
-  1. Verbose error printing so you see EXACTLY why Gemini fails in server logs
-  2. 'recommendation' field added to every FixSuggestion (static, always shown)
-  3. Gemini prompt now produces recommendation + example fix + tips sections
-  4. All static fallback data includes recommendation text
+1. Gemini prompt produces recommendation + example fix + tips sections
+2. All static fallback data includes recommendation text
 ─────────────────────────────────────────────────────────────────────────────
 """
 import os
 import traceback
-import requests as http_requests   # renamed to avoid clash with FastAPI's Request
+import requests as http_requests   
 
 # ── Gemini API Config ──────────────────────────────────────────────────────
 GEMINI_API_KEY = os.getenv(
@@ -493,7 +489,7 @@ def generate_fix_suggestion(
         "severity":       severity,
         "impact_points":  ctx.get("impact_pts", 0),
         "problem":        description or ctx.get("problem", ""),
-        "recommendation": ctx.get("recommendation", ""),   # ← always present
+        "recommendation": ctx.get("recommendation", ""),   
         "files":          files,
         "before_code":    ctx.get("before_stub", ""),
         "after_code":     ctx.get("after_stub", ""),

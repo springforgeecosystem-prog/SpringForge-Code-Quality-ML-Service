@@ -1,7 +1,7 @@
 """
-app/main.py  — COMPLETE FILE (replace your existing main.py)
+app/main.py
 ──────────────────────────────────────────────────────────────────
-SpringForge AI-Driven Code Quality ML Service  v2.1
+SpringForge AI-Driven Code Quality ML Service
 FastAPI application exposing:
 
   EXISTING (Anti-Pattern Classification):
@@ -71,7 +71,7 @@ def home():
 
 
 # ─────────────────────────────────────────────────────────────────
-# ANTI-PATTERN ENDPOINTS (unchanged)
+# ANTI-PATTERN ENDPOINTS 
 # ─────────────────────────────────────────────────────────────────
 
 @app.post("/predict-antipattern")
@@ -87,7 +87,7 @@ def analyze_project(input_data: FileAnalysisInput):
 
 
 # ─────────────────────────────────────────────────────────────────
-# QUALITY SCORE ENDPOINTS (unchanged)
+# QUALITY SCORE ENDPOINTS 
 # ─────────────────────────────────────────────────────────────────
 
 @app.post("/predict-quality-score", response_model=QualityScoreResult)
@@ -158,7 +158,7 @@ def analyze_quality(input_data: FileAnalysisInput):
 
 
 # ─────────────────────────────────────────────────────────────────
-# COMBINED ENDPOINT (unchanged)
+# COMBINED ENDPOINT 
 # ─────────────────────────────────────────────────────────────────
 
 @app.post("/analyze-project-full", response_model=CombinedAnalysisResult)
@@ -252,7 +252,7 @@ def analyze_project_full(input_data: FileAnalysisInput):
 
 
 # ─────────────────────────────────────────────────────────────────
-# NEW: AI FIX SUGGESTION ENDPOINTS  (Gemini)
+# AI FIX SUGGESTION ENDPOINTS  (Gemini)
 # ─────────────────────────────────────────────────────────────────
 
 @app.post("/generate-fix", response_model=FixSuggestion)
@@ -308,7 +308,7 @@ def generate_fixes(input_data: FixRequest):
 
 
 # ─────────────────────────────────────────────────────────────────
-# HELPERS  (unchanged)
+# HELPERS  
 # ─────────────────────────────────────────────────────────────────
 
 def _derive_issues(metrics: dict) -> List[str]:
