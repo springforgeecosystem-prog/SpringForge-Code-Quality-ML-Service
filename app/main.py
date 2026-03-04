@@ -22,9 +22,15 @@ FastAPI application exposing:
 ──────────────────────────────────────────────────────────────────
 """
 
+import os
 from datetime import datetime
 from typing  import List
 from collections import defaultdict
+
+# Load .env file for local development (ignored in production where env vars
+# are set directly in the platform — e.g. Railway, Render, Docker).
+from dotenv import load_dotenv
+load_dotenv()
 
 from fastapi import FastAPI, HTTPException
 
@@ -38,12 +44,12 @@ from app.schemas import (
     CombinedAnalysisResult,
     # shared
     FileFeatures, AntiPatternDetail,
-    # NEW — fix suggestions
+    # fix suggestions
     SingleFixRequest, FixRequest, FixSuggestion, ProjectFixResult,
 )
 from app.model_loader         import AntiPatternModel
 from app.quality_model_loader import QualityScoreModel
-from app.gemini_fix_service   import generate_project_fixes, generate_fix_suggestion   # NEW
+from app.gemini_fix_service   import generate_project_fixes, generate_fix_suggestion
 
 # ── Startup ────────────────────────────────────────────────────────────────
 app = FastAPI(
@@ -59,19 +65,21 @@ quality_model     = QualityScoreModel()
 # ── Health check ───────────────────────────────────────────────────────────
 @app.get("/")
 def home():
+    gemini_configured = bool(os.getenv("GEMINI_API_KEY"))
     return {
-        "status"  : "SpringForge ML Service Running",
-        "version" : "2.1.0",
-        "models"  : [
+        "status"           : "SpringForge ML Service Running",
+        "version"          : "2.1.0",
+        "gemini_configured": gemini_configured,
+        "models"           : [
             "Anti-Pattern Classifier",
             "Quality Score Regressor",
-            "Gemini Fix Suggestion Generator",   # NEW
+            "Gemini Fix Suggestion Generator",
         ],
     }
 
 
 # ─────────────────────────────────────────────────────────────────
-# ANTI-PATTERN ENDPOINTS 
+# ANTI-PATTERN ENDPOINTS
 # ─────────────────────────────────────────────────────────────────
 
 @app.post("/predict-antipattern")
@@ -87,7 +95,7 @@ def analyze_project(input_data: FileAnalysisInput):
 
 
 # ─────────────────────────────────────────────────────────────────
-# QUALITY SCORE ENDPOINTS 
+# QUALITY SCORE ENDPOINTS
 # ─────────────────────────────────────────────────────────────────
 
 @app.post("/predict-quality-score", response_model=QualityScoreResult)
@@ -158,7 +166,7 @@ def analyze_quality(input_data: FileAnalysisInput):
 
 
 # ─────────────────────────────────────────────────────────────────
-# COMBINED ENDPOINT 
+# COMBINED ENDPOINT
 # ─────────────────────────────────────────────────────────────────
 
 @app.post("/analyze-project-full", response_model=CombinedAnalysisResult)
@@ -259,7 +267,7 @@ def analyze_project_full(input_data: FileAnalysisInput):
 def generate_fix(input_data: SingleFixRequest):
     """
     Generate an AI-powered fix suggestion for ONE anti-pattern.
-    Called when the user clicks 'Get AI Fix' on a specific violation.
+    Falls back to static recommendation if GEMINI_API_KEY is not configured.
 
     Example request:
     {
@@ -287,13 +295,7 @@ def generate_fix(input_data: SingleFixRequest):
 def generate_fixes(input_data: FixRequest):
     """
     Generate AI-powered fix suggestions for ALL violations in a project.
-    Called after /analyze-project-full when the user wants detailed fixes.
-
-    The plugin sends the anti_patterns list from CombinedAnalysisResult
-    and receives one FixSuggestion per violation, each with:
-      - Static before/after code examples
-      - Gemini-generated, file-specific fix text
-      - Impact score estimate
+    Falls back to static recommendations if GEMINI_API_KEY is not configured.
     """
     suggestions_raw = generate_project_fixes(
         anti_patterns = [ap.dict() for ap in input_data.anti_patterns],
@@ -308,7 +310,7 @@ def generate_fixes(input_data: FixRequest):
 
 
 # ─────────────────────────────────────────────────────────────────
-# HELPERS  
+# HELPERS
 # ─────────────────────────────────────────────────────────────────
 
 def _derive_issues(metrics: dict) -> List[str]:

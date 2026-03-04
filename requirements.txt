@@ -6,4 +6,5 @@ joblib
 pydantic
 pandas
 xgboost
-requests 
+requests
+python-dotenv 

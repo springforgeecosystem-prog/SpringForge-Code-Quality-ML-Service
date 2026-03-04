@@ -1,9 +1,15 @@
 """
-app/gemini_fix_service.py  
+app/gemini_fix_service.py
 ─────────────────────────────────────────────────────────────────────────────
 Gemini-powered recommendation and fix suggestion generator.
-1. Gemini prompt produces recommendation + example fix + tips sections
-2. All static fallback data includes recommendation text
+
+Changes vs previous version:
+  1. API key loaded from environment variable ONLY — no hardcoded fallback
+  2. Graceful degradation if GEMINI_API_KEY is not set (returns static fix)
+  3. Verbose error printing so you see EXACTLY why Gemini fails in server logs
+  4. 'recommendation' field added to every FixSuggestion (static, always shown)
+  5. Gemini prompt now produces recommendation + example fix + tips sections
+  6. All static fallback data includes recommendation text
 ─────────────────────────────────────────────────────────────────────────────
 """
 import os
@@ -11,10 +17,11 @@ import traceback
 import requests as http_requests   
 
 # ── Gemini API Config ──────────────────────────────────────────────────────
-GEMINI_API_KEY = os.getenv(
-    "GEMINI_API_KEY",
-    "AIzaSyDjejdzf9nGuMEcPMQbYSFDwcP7KlPQWjc"
-)
+# Load from environment variable ONLY — never hardcode API keys in source code.
+# Set this in your deployment platform's environment config (Railway, Render,
+# Docker, etc.) or in a local .env file (which must be in .gitignore).
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
 GEMINI_API_URL = (
     "https://generativelanguage.googleapis.com/v1beta/models/"
     "gemini-2.5-flash:generateContent"
@@ -359,10 +366,14 @@ try {
 
 def _call_gemini(prompt: str) -> str:
     """
-    Call Gemini 1.5 Flash and return the generated text.
-    Prints the EXACT error so you can diagnose from the uvicorn server console.
-    Returns "" on any failure — callers degrade gracefully.
+    Call Gemini and return the generated text.
+    Returns "" if API key is not configured or on any failure.
+    Prints diagnostic info to the uvicorn server console.
     """
+    if not GEMINI_API_KEY:
+        print("  [Gemini] Skipped — GEMINI_API_KEY environment variable is not set.")
+        return ""
+
     try:
         payload = {
             "contents": [{"parts": [{"text": prompt}]}],
@@ -480,6 +491,7 @@ def generate_fix_suggestion(
     Build a complete fix suggestion dict.
     Static fields (recommendation, before/after code) are ALWAYS present.
     gemini_fix is added when Gemini responds successfully.
+    If GEMINI_API_KEY is not set, degrades gracefully to static fix only.
     """
     ctx = ANTI_PATTERN_CONTEXT.get(anti_pattern, ANTI_PATTERN_CONTEXT["clean"])
 
@@ -489,7 +501,7 @@ def generate_fix_suggestion(
         "severity":       severity,
         "impact_points":  ctx.get("impact_pts", 0),
         "problem":        description or ctx.get("problem", ""),
-        "recommendation": ctx.get("recommendation", ""),   
+        "recommendation": ctx.get("recommendation", ""),
         "files":          files,
         "before_code":    ctx.get("before_stub", ""),
         "after_code":     ctx.get("after_stub", ""),
