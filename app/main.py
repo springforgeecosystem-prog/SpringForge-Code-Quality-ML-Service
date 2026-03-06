@@ -367,3 +367,16 @@ def _build_violation_summary(total, file_count, details):
     if high:     parts.append(f"🟠 {high} HIGH")
     if medium:   parts.append(f"🟡 {medium} MEDIUM")
     return "  |  ".join(parts)
+
+
+@app.get("/debug-gemini")
+def debug_gemini():
+    import os
+    key = os.getenv("GEMINI_API_KEY", "")
+    from app.gemini_fix_service import GEMINI_MODEL, GEMINI_API_URL
+    return {
+        "key_set"      : bool(key),
+        "key_prefix"   : key[:8] + "..." if key else "NOT SET",
+        "model"        : GEMINI_MODEL,
+        "api_url"      : GEMINI_API_URL,
+    }
