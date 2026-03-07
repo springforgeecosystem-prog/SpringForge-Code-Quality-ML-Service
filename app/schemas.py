@@ -12,7 +12,7 @@ CHANGES FROM v1:
 """
 
 from pydantic import BaseModel, Field
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 
 # ════════════════════════════════════════════════════════════════
@@ -67,6 +67,14 @@ class FileFeatures(AntiPatternInput):
         default="unknown",
         description="Architecture layer: controller / service / repository / entity / adapter / port / usecase / gateway"
     )
+    # ── NEW in v3 — actual source code for LLM validation ────────
+    # When provided, Gemini validates ML predictions against real code,
+    # filters false positives, and generates context-aware fixes.
+    # When omitted, current ML-only behavior is preserved.
+    source_code : Optional[str] = Field(
+        default=None,
+        description="Full Java source code of the file. Enables LLM validation of ML predictions."
+    )
 
 
 class FileAnalysisInput(BaseModel):
@@ -86,6 +94,10 @@ class AntiPatternDetail(BaseModel):
     files          : List[str]
     description    : str
     recommendation : str
+    # ── NEW in v3 — LLM validation fields ────────────────────────
+    llm_validated   : bool   = False   # True if Gemini confirmed this prediction
+    llm_description : str    = ""      # Gemini's detailed description referencing actual code
+    fix_suggestion  : Optional[dict] = None  # Inline fix: {problem, recommendation, before_code, after_code, gemini_fix}
 
 
 class EnhancedPredictionResult(BaseModel):
@@ -191,6 +203,15 @@ class CombinedAnalysisResult(BaseModel):
     projected_score_after_fixes : float
     quality_summary       : str
     violation_summary     : str
+    # ── NEW in v3 — LLM validation summary ───────────────────────
+    llm_enhanced             : bool               = False  # True if Gemini validation was performed
+    false_positives_filtered : int                 = 0     # ML predictions rejected by Gemini
+    fix_suggestions          : List["FixSuggestion"] = Field(default_factory=list)  # Inline fixes (no separate /generate-fixes call needed)
+    # ── NEW in v4 — Hybrid scoring (ML + LLM) ───────────────────
+    scoring_method           : str                 = "ml_only"   # "hybrid", "ml_adjusted", or "ml_only"
+    quality_reasoning        : str                 = ""          # Gemini's explanation of the score
+    quality_strengths        : List[str]            = Field(default_factory=list)  # Project strengths
+    quality_improvements     : List[str]            = Field(default_factory=list)  # Suggested improvements
 
 
 # ════════════════════════════════════════════════════════════════
@@ -209,6 +230,11 @@ class SingleFixRequest(BaseModel):
 class FixRequest(BaseModel):
     anti_patterns        : List[AntiPatternDetail]
     architecture_pattern : str = "layered"
+    # ── NEW in v3 — optional source code for context-aware fixes ──
+    file_sources         : Optional[Dict[str, str]] = Field(
+        default=None,
+        description="Map of file_name → source_code for context-aware fix generation"
+    )
 
 
 class FixSuggestion(BaseModel):
@@ -229,3 +255,7 @@ class ProjectFixResult(BaseModel):
     architecture_pattern : str
     total_fixes          : int
     suggestions          : List[FixSuggestion]
+
+
+# Resolve forward reference: CombinedAnalysisResult -> FixSuggestion
+CombinedAnalysisResult.model_rebuild()

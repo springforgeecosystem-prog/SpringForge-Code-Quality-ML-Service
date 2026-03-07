@@ -32,6 +32,17 @@ import pandas as pd
 import joblib
 from typing import Tuple
 
+# ── Compatibility shim for models saved with scikit-learn 1.6.x ────────────
+# sklearn 1.8+ removed _RemainderColsList; patching it prevents
+# AttributeError when unpickling ColumnTransformer from older versions.
+import sklearn.compose._column_transformer as _ct
+if not hasattr(_ct, '_RemainderColsList'):
+    class _RemainderColsList(list):
+        """Drop-in stub so pickled ColumnTransformers from sklearn 1.6.x load."""
+        def __reduce__(self):
+            return (_RemainderColsList, (list(self),))
+    _ct._RemainderColsList = _RemainderColsList
+
 DEPENDENCY_COLS = [
     'controller_deps', 'service_deps', 'repository_deps', 'entity_deps',
     'adapter_deps',    'port_deps',    'usecase_deps',    'gateway_deps',

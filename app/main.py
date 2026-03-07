@@ -50,6 +50,15 @@ from app.schemas import (
 from app.model_loader         import AntiPatternModel
 from app.quality_model_loader import QualityScoreModel
 from app.gemini_fix_service   import generate_project_fixes, generate_fix_suggestion
+from app.gemini_validation_service import (
+    validate_all_predictions,
+    check_clean_predictions,
+)
+from app.gemini_scoring_service import (
+    get_llm_quality_assessment,
+    compute_hybrid_file_scores,
+    compute_hybrid_overall,
+)
 
 # ── Startup ────────────────────────────────────────────────────────────────
 app = FastAPI(
@@ -178,6 +187,7 @@ def analyze_project_full(input_data: FileAnalysisInput):
     architecture = files[0].architecture_pattern
     now          = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+    # ── Step 1: Quality scoring per file (unchanged) ─────────────────
     file_results: List[FileQualityResult] = []
     for f in files:
         metrics = f.dict()
@@ -191,34 +201,266 @@ def analyze_project_full(input_data: FileAnalysisInput):
             issues=issues,
         ))
 
+    # ── Step 2: ML anti-pattern prediction per file (unchanged) ─────
     ap_violations: dict = defaultdict(lambda: {'files': [], 'layers': set(), 'confidences': []})
     clean_files: List[str] = []
+    clean_confidences: dict = {}   # track confidence for clean predictions
     for f in files:
         features     = f.dict()
         ap, conf     = antipattern_model.predict_with_confidence(features)
         if ap == "clean":
             clean_files.append(f.file_name)
+            clean_confidences[f.file_name] = conf
         else:
             layer = antipattern_model.detect_layer(features)
             ap_violations[ap]['files'].append(f.file_name)
             ap_violations[ap]['layers'].add(layer)
             ap_violations[ap]['confidences'].append(conf)
 
+    # ── Step 3: Check if source code is available for LLM validation ──
+    source_code_map = {}           # {file_name: source_code}
+    file_layer_map  = {}           # {file_name: layer}
+    for f in files:
+        if f.source_code:
+            source_code_map[f.file_name] = f.source_code
+        file_layer_map[f.file_name] = f.layer or "unknown"
+
+    has_source_code    = bool(source_code_map)
+    llm_enhanced       = False
+    false_positives    = 0
+    false_positive_files = []   # files cleared by LLM (ML was wrong)
+    fix_suggestions_list = []
+
+    if has_source_code and ap_violations:
+        # ── Step 4: LLM validation of all ML predictions ─────────────
+        print(f"\n  [★ LLM Pipeline] Source code available for {len(source_code_map)}/{len(files)} files — running Gemini validation...")
+
+        # Build grouped predictions with metadata for the validator
+        grouped = {}
+        for ap_type, data in ap_violations.items():
+            info = antipattern_model.ANTI_PATTERN_INFO.get(ap_type, {
+                "severity": "UNKNOWN", "description": ap_type})
+            grouped[ap_type] = {
+                "files": data['files'],
+                "layers": data['layers'],
+                "confidences": data['confidences'],
+                "severity": info.get('severity', 'MEDIUM'),
+                "description": info.get('description', ''),
+            }
+
+        validation_results = validate_all_predictions(
+            grouped_predictions=grouped,
+            files_map=source_code_map,
+            architecture=architecture,
+        )
+
+        # ── Step 4a: Apply validation results ───────────────────────
+        validated_violations = {}        # ap_type -> data (only valid ones)
+        for ap_type, data in ap_violations.items():
+            vr = validation_results.get(ap_type, {})
+
+            if vr.get("is_valid", True):
+                # Prediction confirmed — keep it, enrich with LLM data
+                validated_violations[ap_type] = data
+                validated_violations[ap_type]["_validation"] = vr
+            else:
+                # False positive — Gemini says code is actually correct
+                false_positives += 1
+                print(f"  [★ LLM Pipeline] ❌ FILTERED false positive: '{ap_type}' — {vr.get('reasoning', '')}")
+                # Move affected files back to clean list
+                for fname in data['files']:
+                    if fname not in clean_files:
+                        clean_files.append(fname)
+                    if fname not in false_positive_files:
+                        false_positive_files.append(fname)
+
+        # Replace ap_violations with only validated ones
+        ap_violations = validated_violations
+        llm_enhanced = True
+
+        # ── Step 4b: Check low-confidence clean predictions ─────────
+        clean_with_code = {}
+        for fname in clean_files:
+            if fname in source_code_map:
+                clean_with_code[fname] = {
+                    "source_code": source_code_map[fname],
+                    "layer": file_layer_map.get(fname, "unknown"),
+                }
+
+        if clean_with_code:
+            discovered = check_clean_predictions(
+                clean_files_with_code=clean_with_code,
+                architecture=architecture,
+                confidence_threshold=0.70,
+                clean_confidences=clean_confidences,
+            )
+            # Incorporate newly discovered anti-patterns
+            for d in discovered:
+                ap_type = d["type"]
+                fname   = d["file"]
+                if ap_type not in ap_violations:
+                    ap_violations[ap_type] = {
+                        'files': [], 'layers': set(), 'confidences': [],
+                        '_validation': {
+                            'is_valid': True,
+                            'llm_validated': True,
+                            'description': d.get('description', ''),
+                            'recommendation': d.get('recommendation', ''),
+                            'before_code': d.get('before_code', ''),
+                            'after_code': d.get('after_code', ''),
+                            'severity': d.get('severity', 'MEDIUM'),
+                            'reasoning': 'Discovered by LLM review of low-confidence clean prediction',
+                        }
+                    }
+                ap_violations[ap_type]['files'].append(fname)
+                ap_violations[ap_type]['layers'].add(d.get('layer', 'unknown'))
+                ap_violations[ap_type]['confidences'].append(0.0)  # ML missed it
+                # Remove from clean_files
+                if fname in clean_files:
+                    clean_files.remove(fname)
+
+    # ── Step 5: Build anti-pattern details (enriched with LLM data) ───
     ap_details: List[AntiPatternDetail] = []
     for ap, data in ap_violations.items():
         info     = antipattern_model.ANTI_PATTERN_INFO.get(ap, {
             "severity": "UNKNOWN", "description": "Unknown anti-pattern",
             "recommendation": "Review manually"})
-        avg_conf = sum(data['confidences']) / len(data['confidences'])
+        avg_conf = sum(data['confidences']) / len(data['confidences']) if data['confidences'] else 0
+
+        # Get LLM validation data if available
+        vr = data.get('_validation', {})
+        is_llm_validated = vr.get('llm_validated', False)
+
+        # Use LLM description/recommendation if available, fall back to ML static info
+        description    = vr.get('description') or info.get('description', '')
+        recommendation = vr.get('recommendation') or info.get('recommendation', '')
+        severity       = vr.get('severity') or info.get('severity', 'MEDIUM')
+
+        # Build inline fix suggestion if LLM provided one
+        fix_dict = None
+        if is_llm_validated and (vr.get('before_code') or vr.get('after_code')):
+            from app.gemini_fix_service import ANTI_PATTERN_CONTEXT
+            ctx = ANTI_PATTERN_CONTEXT.get(ap, {})
+            fix_dict = {
+                "problem": description,
+                "recommendation": recommendation,
+                "before_code": vr.get('before_code', ''),
+                "after_code": vr.get('after_code', ''),
+                "gemini_fix": f"💡 RECOMMENDATION:\n{recommendation}\n\n🔧 EXAMPLE FIX:\n// ❌ BEFORE\n{vr.get('before_code', '')}\n\n// ✅ AFTER\n{vr.get('after_code', '')}",
+                "impact_points": ctx.get('impact_pts', 0),
+            }
+
         ap_details.append(AntiPatternDetail(
-            type=ap, severity=info['severity'],
+            type=ap, severity=severity,
             affected_layer=", ".join(sorted(data['layers'])),
             confidence=round(avg_conf, 2), files=data['files'],
-            description=info['description'], recommendation=info['recommendation'],
+            description=description, recommendation=recommendation,
+            llm_validated=is_llm_validated,
+            llm_description=vr.get('description', ''),
+            fix_suggestion=fix_dict,
         ))
     severity_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "NONE": 4}
     ap_details.sort(key=lambda x: severity_order.get(x.severity, 5))
 
+    # ── Step 6: Generate fix suggestions inline when source code available ─
+    if has_source_code and ap_details:
+        print(f"  [★ LLM Pipeline] Generating context-aware fix suggestions for {len(ap_details)} validated violations...")
+        fix_raws = generate_project_fixes(
+            anti_patterns   = [ap.dict() for ap in ap_details],
+            architecture    = architecture,
+            source_code_map = source_code_map,
+        )
+        fix_suggestions_list = [FixSuggestion(**s) for s in fix_raws]
+
+    # ── Step 7: Hybrid quality scoring (ML + LLM) ──────────────────
+    scoring_method       = "ml_only"
+    quality_reasoning    = ""
+    quality_strengths    = []
+    quality_improvements = []
+
+    if has_source_code:
+        # Collect ML per-file scores
+        ml_file_scores = {fr.file_name: fr.quality_score for fr in file_results}
+        ml_overall     = sum(ml_file_scores.values()) / len(ml_file_scores)
+
+        # Map each file to its violation severities
+        file_violations_map = {}
+        for ap in ap_details:
+            for fname in ap.files:
+                file_violations_map.setdefault(fname, []).append(ap.severity)
+
+        # Build file summaries for the Gemini scoring prompt
+        file_summaries = []
+        for fr in file_results:
+            violations_for_file = []
+            for ap in ap_details:
+                if fr.file_name in ap.files:
+                    violations_for_file.append(f"{ap.type} ({ap.severity})")
+            file_summaries.append({
+                "file_name":  fr.file_name,
+                "layer":      fr.layer,
+                "ml_score":   fr.quality_score,
+                "violations": violations_for_file,
+            })
+
+        # Build validated violation summaries
+        violation_summaries = [
+            {"type": ap.type, "severity": ap.severity,
+             "files": ap.files, "llm_validated": ap.llm_validated}
+            for ap in ap_details
+        ]
+
+        print(f"\n  [★ Hybrid Scoring] Running Gemini quality assessment "
+              f"(ML baseline: {ml_overall:.0f}/100, violations: {len(ap_details)}, "
+              f"clean: {len(clean_files)})...")
+
+        llm_assessment = get_llm_quality_assessment(
+            architecture=architecture,
+            file_summaries=file_summaries,
+            validated_violations=violation_summaries,
+            clean_files=clean_files,
+            false_positives_filtered=false_positives,
+            ml_overall_score=ml_overall,
+        )
+
+        # Compute hybrid per-file scores
+        hybrid_scores = compute_hybrid_file_scores(
+            ml_file_scores=ml_file_scores,
+            llm_assessment=llm_assessment,
+            file_violations=file_violations_map,
+            clean_files=clean_files,
+            false_positive_files=false_positive_files,
+            llm_validated=llm_enhanced or (not ap_details),  # also hybrid when no violations
+        )
+
+        # Update file_results with hybrid scores
+        updated_results = []
+        for fr in file_results:
+            if fr.file_name in hybrid_scores:
+                hs = hybrid_scores[fr.file_name]
+                updated_results.append(FileQualityResult(
+                    file_name=fr.file_name, file_path=fr.file_path,
+                    layer=fr.layer,
+                    quality_score=hs["quality_score"],
+                    quality_label=hs["quality_label"],
+                    quality_emoji=hs["quality_emoji"],
+                    quality_display=hs["quality_display"],
+                    issues=fr.issues,
+                ))
+            else:
+                updated_results.append(fr)
+        file_results = updated_results
+
+        # Extract LLM assessment metadata
+        if llm_assessment:
+            scoring_method       = "hybrid"
+            quality_reasoning    = llm_assessment.get("reasoning", "")
+            quality_strengths    = llm_assessment.get("strengths", [])
+            quality_improvements = llm_assessment.get("improvements", [])
+        else:
+            scoring_method = "ml_adjusted" if llm_enhanced else "ml_only"
+
+    # ── Step 8: Build layer scores ────────────────────────────────
     layer_map: dict = defaultdict(list)
     for fr in file_results:
         layer_map[fr.layer].append(fr)
@@ -235,6 +477,7 @@ def analyze_project_full(input_data: FileAnalysisInput):
         ))
     layer_scores.sort(key=lambda x: x.mean_score, reverse=True)
 
+    # Compute hybrid overall if source code was available
     overall = sum(f.quality_score for f in file_results) / len(file_results)
     o_label, o_emoji = quality_model._score_label(overall)
     total_issues   = sum(len(f.issues) for f in file_results)
@@ -256,6 +499,15 @@ def analyze_project_full(input_data: FileAnalysisInput):
         projected_score_after_fixes=round(projected, 1),
         quality_summary=_build_quality_summary(overall, o_label, layer_scores, total_issues, files_violated),
         violation_summary=_build_violation_summary(total_viol, len(files), ap_details),
+        # ── LLM fields ──
+        llm_enhanced=llm_enhanced,
+        false_positives_filtered=false_positives,
+        fix_suggestions=fix_suggestions_list,
+        # ── Hybrid scoring fields ──
+        scoring_method=scoring_method,
+        quality_reasoning=quality_reasoning,
+        quality_strengths=quality_strengths,
+        quality_improvements=quality_improvements,
     )
 
 
@@ -296,10 +548,15 @@ def generate_fixes(input_data: FixRequest):
     """
     Generate AI-powered fix suggestions for ALL violations in a project.
     Falls back to static recommendations if GEMINI_API_KEY is not configured.
+    Accepts optional file_sources for context-aware fixes.
     """
+    # Build source code map from optional file_sources
+    source_map = input_data.file_sources if input_data.file_sources else None
+
     suggestions_raw = generate_project_fixes(
-        anti_patterns = [ap.dict() for ap in input_data.anti_patterns],
-        architecture  = input_data.architecture_pattern,
+        anti_patterns   = [ap.dict() for ap in input_data.anti_patterns],
+        architecture    = input_data.architecture_pattern,
+        source_code_map = source_map,
     )
     suggestions = [FixSuggestion(**s) for s in suggestions_raw]
     return ProjectFixResult(

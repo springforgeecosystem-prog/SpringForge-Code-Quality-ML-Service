@@ -30,7 +30,7 @@ import traceback
 import requests as http_requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_API_KEY = "AIzaSyA1CH7Gz6IYTg4gFr0EVAhRW6o-72VbNfQ"
 
 # FIX 1: Use gemini-2.5-flash as default — stable and available.
 # Override with GEMINI_MODEL env variable if you want a different model.
@@ -542,7 +542,15 @@ def _display_name(anti_pattern: str) -> str:
     return DISPLAY_NAMES.get(anti_pattern, anti_pattern.replace("_", " ").title())
 
 
-def build_gemini_prompt(anti_pattern, files, architecture, layer, severity, description):
+def _truncate_source(code: str, max_lines: int = 300) -> str:
+    """Keep source code to a reasonable size for the prompt."""
+    lines = code.splitlines()
+    if len(lines) <= max_lines:
+        return code
+    return "\n".join(lines[:max_lines]) + f"\n// ... ({len(lines) - max_lines} more lines truncated)"
+
+
+def build_gemini_prompt(anti_pattern, files, architecture, layer, severity, description, source_code_map=None):
     ctx       = ANTI_PATTERN_CONTEXT.get(anti_pattern, {})
     before    = ctx.get("before_stub", "")
     after     = ctx.get("after_stub",  "")
@@ -551,12 +559,36 @@ def build_gemini_prompt(anti_pattern, files, architecture, layer, severity, desc
     if len(files) > 5:
         file_list += f"\n  - ... and {len(files) - 5} more files"
 
+    # ── NEW: Include actual source code when available ──────────────
+    source_section = ""
+    if source_code_map:
+        source_parts = []
+        for fname in files[:5]:  # limit to first 5 files
+            code = source_code_map.get(fname)
+            if code:
+                source_parts.append(f"=== {fname} ===\n{_truncate_source(code)}")
+        if source_parts:
+            source_section = (
+                "\n\nACTUAL SOURCE CODE OF AFFECTED FILES:\n"
+                + "\n\n".join(source_parts)
+                + "\n\nIMPORTANT: Use the ACTUAL class names, method names, field names, "
+                  "and package structure from the source code above in your fix suggestion. "
+                  "Do NOT use generic names like OrderController or UserService unless they "
+                  "actually appear in the code.\n"
+            )
+
     seed = ""
     if before and after:
-        seed = (
-            f"\nReference example (adapt for the files listed above):\n"
-            f"// ❌ BEFORE\n{before}\n// ✅ AFTER\n{after}\n"
-        )
+        if source_code_map:
+            seed = (
+                f"\nReference pattern (adapt using the ACTUAL class names from the source code above):\n"
+                f"// ❌ PATTERN BEFORE\n{before}\n// ✅ PATTERN AFTER\n{after}\n"
+            )
+        else:
+            seed = (
+                f"\nReference example (adapt for the files listed above):\n"
+                f"// ❌ BEFORE\n{before}\n// ✅ AFTER\n{after}\n"
+            )
 
     return f"""You are a senior Spring Boot architect reviewing a {architecture} architecture project.
 
@@ -567,6 +599,7 @@ Severity: {severity}
 Files affected:
 {file_list}
 Problem: {description}
+{source_section}
 {seed}
 Write a concise fix suggestion using EXACTLY this format:
 
@@ -575,10 +608,10 @@ Write a concise fix suggestion using EXACTLY this format:
 
 🔧 EXAMPLE FIX:
 // ❌ BEFORE
-<short problematic code>
+<short problematic code using actual class names from the project>
 
 // ✅ AFTER
-<short corrected code>
+<short corrected code using actual class names from the project>
 
 ⭐ EXTRA TIPS:
 • <tip 1 specific to {architecture} architecture>
@@ -586,9 +619,14 @@ Write a concise fix suggestion using EXACTLY this format:
 
 
 def generate_fix_suggestion(
-    anti_pattern, files, architecture, layer, severity, description, use_gemini=True
+    anti_pattern, files, architecture, layer, severity, description,
+    use_gemini=True, source_code_map=None,
 ):
-    """Generate a fix suggestion for a single anti-pattern."""
+    """Generate a fix suggestion for a single anti-pattern.
+
+    Args:
+        source_code_map: Optional dict {file_name: source_code} for context-aware fixes.
+    """
     # FIX 5: Guard against unknown patterns — log warning, use clean fallback
     if anti_pattern not in ANTI_PATTERN_CONTEXT:
         print(f"  [FixService] WARNING: unknown anti_pattern '{anti_pattern}' — using clean fallback")
@@ -613,9 +651,8 @@ def generate_fix_suggestion(
         return result
 
     print(f"\n  → Gemini fix for '{anti_pattern}' ({architecture}) ...")
-    print(f"\n  → [FixService] generate_fix_suggestion() called")
-    print(f"  → [FixService] anti_pattern={anti_pattern}, use_gemini={use_gemini}, arch={architecture}")
-    print(f"\n  → Gemini fix for '{anti_pattern}' ({architecture}) ...")
+    print(f"  → [FixService] anti_pattern={anti_pattern}, use_gemini={use_gemini}, "
+          f"arch={architecture}, has_source={'yes' if source_code_map else 'no'}")
     gemini_text = _call_gemini(
         build_gemini_prompt(
             anti_pattern,
@@ -624,6 +661,7 @@ def generate_fix_suggestion(
             layer or ctx.get("layer", ""),
             severity,
             description or ctx.get("problem", ""),
+            source_code_map=source_code_map,
         )
     )
     if gemini_text:
@@ -632,13 +670,14 @@ def generate_fix_suggestion(
     return result
 
 
-def generate_project_fixes(anti_patterns: list, architecture: str) -> list:
+def generate_project_fixes(anti_patterns: list, architecture: str, source_code_map: dict = None) -> list:
     """
     Generate fix suggestions for all violations in a project.
 
+    Args:
+        source_code_map: Optional dict {file_name: source_code} for context-aware fixes.
+
     FIX 2: Calls Gemini in PARALLEL (max 5 workers) instead of sequentially.
-    Old behaviour with 8 violations: ~120 seconds.
-    New behaviour with 8 violations: ~30 seconds.
     """
     # Filter out clean entries up front
     violations = [ap for ap in anti_patterns if ap.get("type", "") not in ("clean", "")]
@@ -647,14 +686,24 @@ def generate_project_fixes(anti_patterns: list, architecture: str) -> list:
         return []
 
     def _fix_one(ap: dict) -> dict:
+        # Build per-violation source map from only the affected files
+        ap_source_map = None
+        if source_code_map:
+            ap_source_map = {
+                fname: source_code_map[fname]
+                for fname in ap.get("files", [])
+                if fname in source_code_map
+            } or None
+
         return generate_fix_suggestion(
-            anti_pattern = ap.get("type", ""),
-            files        = ap.get("files", []),
-            architecture = architecture,
-            layer        = ap.get("affected_layer", ""),
-            severity     = ap.get("severity", ""),
-            description  = ap.get("description", ""),
-            use_gemini   = True,
+            anti_pattern    = ap.get("type", ""),
+            files           = ap.get("files", []),
+            architecture    = architecture,
+            layer           = ap.get("affected_layer", ""),
+            severity        = ap.get("severity", ""),
+            description     = ap.get("description", ""),
+            use_gemini      = True,
+            source_code_map = ap_source_map,
         )
 
     results    = [None] * len(violations)
