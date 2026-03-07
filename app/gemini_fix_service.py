@@ -586,7 +586,8 @@ Write a concise fix suggestion using EXACTLY this format:
 
 
 def generate_fix_suggestion(
-    anti_pattern, files, architecture, layer, severity, description, use_gemini=True
+    anti_pattern, files, architecture, layer, severity, description,
+    use_gemini=True, detection_source="ml_model"
 ):
     """Generate a fix suggestion for a single anti-pattern."""
     # FIX 5: Guard against unknown patterns — log warning, use clean fallback
@@ -596,17 +597,18 @@ def generate_fix_suggestion(
     ctx = ANTI_PATTERN_CONTEXT.get(anti_pattern, ANTI_PATTERN_CONTEXT["clean"])
 
     result = {
-        "anti_pattern"  : anti_pattern,
-        "layer"         : layer or ctx.get("layer", ""),
-        "severity"      : severity,
-        "impact_points" : ctx.get("impact_pts", 0),
-        "problem"       : description or ctx.get("problem", ""),
-        "recommendation": ctx.get("recommendation", ""),
-        "files"         : files,
-        "before_code"   : ctx.get("before_stub", ""),
-        "after_code"    : ctx.get("after_stub",  ""),
-        "gemini_fix"    : "",
-        "ai_powered"    : False,
+        "anti_pattern"    : anti_pattern,
+        "layer"           : layer or ctx.get("layer", ""),
+        "severity"        : severity,
+        "impact_points"   : ctx.get("impact_pts", 0),
+        "problem"         : description or ctx.get("problem", ""),
+        "recommendation"  : ctx.get("recommendation", ""),
+        "files"           : files,
+        "before_code"     : ctx.get("before_stub", ""),
+        "after_code"      : ctx.get("after_stub",  ""),
+        "gemini_fix"      : "",
+        "ai_powered"      : False,
+        "detection_source": detection_source,
     }
 
     if not use_gemini or anti_pattern == "clean":
@@ -648,13 +650,14 @@ def generate_project_fixes(anti_patterns: list, architecture: str) -> list:
 
     def _fix_one(ap: dict) -> dict:
         return generate_fix_suggestion(
-            anti_pattern = ap.get("type", ""),
-            files        = ap.get("files", []),
-            architecture = architecture,
-            layer        = ap.get("affected_layer", ""),
-            severity     = ap.get("severity", ""),
-            description  = ap.get("description", ""),
-            use_gemini   = True,
+            anti_pattern     = ap.get("type", ""),
+            files            = ap.get("files", []),
+            architecture     = architecture,
+            layer            = ap.get("affected_layer", ""),
+            severity         = ap.get("severity", ""),
+            description      = ap.get("description", ""),
+            use_gemini       = True,
+            detection_source = ap.get("detection_source", "ml_model"),
         )
 
     results    = [None] * len(violations)
@@ -674,13 +677,14 @@ def generate_project_fixes(anti_patterns: list, architecture: str) -> list:
                 # Fall back to static fix for this violation
                 ap = violations[idx]
                 results[idx] = generate_fix_suggestion(
-                    anti_pattern = ap.get("type", ""),
-                    files        = ap.get("files", []),
-                    architecture = architecture,
-                    layer        = ap.get("affected_layer", ""),
-                    severity     = ap.get("severity", ""),
-                    description  = ap.get("description", ""),
-                    use_gemini   = False,   # static only on worker failure
+                    anti_pattern     = ap.get("type", ""),
+                    files            = ap.get("files", []),
+                    architecture     = architecture,
+                    layer            = ap.get("affected_layer", ""),
+                    severity         = ap.get("severity", ""),
+                    description      = ap.get("description", ""),
+                    use_gemini       = False,   # static only on worker failure
+                    detection_source = ap.get("detection_source", "ml_model"),
                 )
 
     return [r for r in results if r is not None]

@@ -47,9 +47,15 @@ from app.schemas import (
     # fix suggestions
     SingleFixRequest, FixRequest, FixSuggestion, ProjectFixResult,
 )
-from app.model_loader         import AntiPatternModel
-from app.quality_model_loader import QualityScoreModel
-from app.gemini_fix_service   import generate_project_fixes, generate_fix_suggestion
+from app.model_loader              import AntiPatternModel
+from app.quality_model_loader      import QualityScoreModel
+from app.gemini_fix_service        import generate_project_fixes, generate_fix_suggestion
+from app.gemini_detection_service  import (
+    detect_antipattern,
+    detect_antipatterns_batch,
+    adjust_quality_for_detections,
+    should_use_fallback,
+)
 
 # ── Startup ────────────────────────────────────────────────────────────────
 app = FastAPI(
@@ -84,14 +90,105 @@ def home():
 
 @app.post("/predict-antipattern")
 def predict_antipattern(input_data: AntiPatternInput):
-    features   = input_data.dict()
-    prediction = antipattern_model.predict(features)
-    return {"anti_pattern": prediction}
+    features = input_data.dict()
+    ml_pred, ml_conf = antipattern_model.predict_with_confidence(features)
+    architecture = features.get("architecture_pattern", "layered")
+
+    detections = detect_antipattern(features, ml_pred, ml_conf, architecture)
+    # Return primary detection (highest confidence non-clean, or first)
+    primary = detections[0]
+    return {
+        "anti_pattern": primary["anti_pattern"],
+        "confidence": round(primary["confidence"], 2),
+        "detection_source": primary["detection_source"],
+    }
 
 
 @app.post("/analyze-project", response_model=EnhancedPredictionResult)
 def analyze_project(input_data: FileAnalysisInput):
-    return antipattern_model.analyze_project(input_data.files)
+    files = input_data.files
+    if not files:
+        raise HTTPException(status_code=400, detail="No files provided")
+
+    architecture = files[0].architecture_pattern
+    gemini_fallback_used = False
+
+    # Step 1: ML predictions for all files
+    files_with_preds = []
+    for f in files:
+        features = f.dict()
+        ml_pred, ml_conf = antipattern_model.predict_with_confidence(features)
+        features["_ml_prediction"] = ml_pred
+        features["_ml_confidence"] = ml_conf
+        files_with_preds.append(features)
+
+    # Step 2: Run fallback detection (parallel Gemini for suspicious files)
+    all_detections = detect_antipatterns_batch(files_with_preds, architecture)
+
+    # Step 3: Aggregate violations
+    ap_violations: dict = defaultdict(lambda: {
+        'files': [], 'layers': set(), 'confidences': [],
+        'detection_source': 'ml_model', 'reasoning': None
+    })
+    clean_files: List[str] = []
+
+    for f in files:
+        fname = f.file_name
+        detections = all_detections.get(fname, [])
+        file_is_clean = True
+
+        for d in detections:
+            ap = d["anti_pattern"]
+            if ap == "clean":
+                continue
+            file_is_clean = False
+            layer = antipattern_model.detect_layer(f.dict())
+            ap_violations[ap]['files'].append(fname)
+            ap_violations[ap]['layers'].add(layer)
+            ap_violations[ap]['confidences'].append(d["confidence"])
+            # Track detection source (gemini_ai/rule_based take priority over ml_model)
+            if d["detection_source"] in ("gemini_ai", "rule_based"):
+                ap_violations[ap]['detection_source'] = d["detection_source"]
+                ap_violations[ap]['reasoning'] = d.get("reasoning")
+                gemini_fallback_used = True
+
+        if file_is_clean:
+            clean_files.append(fname)
+
+    # Step 4: Build response
+    ap_details: List[AntiPatternDetail] = []
+    for ap, data in ap_violations.items():
+        info = antipattern_model.ANTI_PATTERN_INFO.get(ap, {
+            "severity": "UNKNOWN", "description": "Unknown anti-pattern",
+            "recommendation": "Review manually"})
+        avg_conf = sum(data['confidences']) / len(data['confidences'])
+        ap_details.append(AntiPatternDetail(
+            type=ap, severity=info['severity'],
+            affected_layer=", ".join(sorted(data['layers'])),
+            confidence=round(avg_conf, 2), files=data['files'],
+            description=info['description'], recommendation=info['recommendation'],
+            detection_source=data['detection_source'],
+            reasoning=data['reasoning'],
+        ))
+
+    severity_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "NONE": 4}
+    ap_details.sort(key=lambda x: severity_order.get(x.severity, 5))
+
+    total_viol = sum(len(d['files']) for d in ap_violations.values())
+    summary = (
+        f"✅ No violations in {len(files)} files"
+        if total_viol == 0
+        else f"⚠️ {total_viol} violations across {len(files)} files"
+    )
+
+    return EnhancedPredictionResult(
+        architecture_pattern=architecture,
+        total_files_analyzed=len(files),
+        total_violations=total_viol,
+        anti_patterns=ap_details,
+        summary=summary,
+        gemini_fallback_used=gemini_fallback_used,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -177,7 +274,11 @@ def analyze_project_full(input_data: FileAnalysisInput):
 
     architecture = files[0].architecture_pattern
     now          = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    gemini_fallback_used = False
+    quality_adjusted     = False
+    original_overall     = None
 
+    # ── Step 1: ML quality scores for all files ─────────────────────────
     file_results: List[FileQualityResult] = []
     for f in files:
         metrics = f.dict()
@@ -191,22 +292,76 @@ def analyze_project_full(input_data: FileAnalysisInput):
             issues=issues,
         ))
 
-    ap_violations: dict = defaultdict(lambda: {'files': [], 'layers': set(), 'confidences': []})
-    clean_files: List[str] = []
+    # ── Step 2: ML predictions + fallback detection ─────────────────────
+    files_with_preds = []
     for f in files:
-        features     = f.dict()
-        ap, conf     = antipattern_model.predict_with_confidence(features)
-        if ap == "clean":
-            clean_files.append(f.file_name)
-        else:
-            layer = antipattern_model.detect_layer(features)
-            ap_violations[ap]['files'].append(f.file_name)
-            ap_violations[ap]['layers'].add(layer)
-            ap_violations[ap]['confidences'].append(conf)
+        features = f.dict()
+        ml_pred, ml_conf = antipattern_model.predict_with_confidence(features)
+        features["_ml_prediction"] = ml_pred
+        features["_ml_confidence"] = ml_conf
+        files_with_preds.append(features)
 
+    all_detections = detect_antipatterns_batch(files_with_preds, architecture)
+
+    # ── Step 3: Aggregate violations with detection_source ──────────────
+    ap_violations: dict = defaultdict(lambda: {
+        'files': [], 'layers': set(), 'confidences': [],
+        'detection_source': 'ml_model', 'reasoning': None
+    })
+    clean_files: List[str] = []
+    # Track per-file fallback detections for quality adjustment
+    file_fallback_detections: dict = {}  # fname -> list of detections
+
+    for f in files:
+        fname = f.file_name
+        detections = all_detections.get(fname, [])
+        file_is_clean = True
+        fallback_dets = []
+
+        for d in detections:
+            ap = d["anti_pattern"]
+            if ap == "clean":
+                continue
+            file_is_clean = False
+            layer = antipattern_model.detect_layer(f.dict())
+            ap_violations[ap]['files'].append(fname)
+            ap_violations[ap]['layers'].add(layer)
+            ap_violations[ap]['confidences'].append(d["confidence"])
+            if d["detection_source"] in ("gemini_ai", "rule_based"):
+                ap_violations[ap]['detection_source'] = d["detection_source"]
+                ap_violations[ap]['reasoning'] = d.get("reasoning")
+                gemini_fallback_used = True
+                fallback_dets.append(d)
+
+        if file_is_clean:
+            clean_files.append(fname)
+        if fallback_dets:
+            file_fallback_detections[fname] = fallback_dets
+
+    # ── Step 4: Adjust quality scores for fallback-detected patterns ────
+    if file_fallback_detections:
+        quality_adjusted = True
+        original_overall = round(
+            sum(fr.quality_score for fr in file_results) / len(file_results), 1
+        )
+        for fr in file_results:
+            if fr.file_name in file_fallback_detections:
+                adj_score, adj_reason = adjust_quality_for_detections(
+                    fr.quality_score, file_fallback_detections[fr.file_name]
+                )
+                if adj_reason:
+                    fr.quality_score = adj_score
+                    fr.quality_adjusted = True
+                    fr.adjustment_reason = adj_reason
+                    label, emoji = quality_model._score_label(adj_score)
+                    fr.quality_label = label
+                    fr.quality_emoji = emoji
+                    fr.quality_display = f"{emoji} {label} ({adj_score:.0f}/100)"
+
+    # ── Step 5: Build anti-pattern details ──────────────────────────────
     ap_details: List[AntiPatternDetail] = []
     for ap, data in ap_violations.items():
-        info     = antipattern_model.ANTI_PATTERN_INFO.get(ap, {
+        info = antipattern_model.ANTI_PATTERN_INFO.get(ap, {
             "severity": "UNKNOWN", "description": "Unknown anti-pattern",
             "recommendation": "Review manually"})
         avg_conf = sum(data['confidences']) / len(data['confidences'])
@@ -215,10 +370,13 @@ def analyze_project_full(input_data: FileAnalysisInput):
             affected_layer=", ".join(sorted(data['layers'])),
             confidence=round(avg_conf, 2), files=data['files'],
             description=info['description'], recommendation=info['recommendation'],
+            detection_source=data['detection_source'],
+            reasoning=data['reasoning'],
         ))
     severity_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "NONE": 4}
     ap_details.sort(key=lambda x: severity_order.get(x.severity, 5))
 
+    # ── Step 6: Layer scores & summary ──────────────────────────────────
     layer_map: dict = defaultdict(list)
     for fr in file_results:
         layer_map[fr.layer].append(fr)
@@ -240,7 +398,7 @@ def analyze_project_full(input_data: FileAnalysisInput):
     total_issues   = sum(len(f.issues) for f in file_results)
     files_violated = sum(1 for f in file_results if f.issues)
     total_viol     = sum(len(d['files']) for d in ap_violations.values())
-    avg_loc        = sum(f.loc   for f in files) / len(files)
+    avg_loc        = sum(f.loc for f in files) / len(files)
     avg_deps       = sum(f.total_cross_layer_deps for f in files) / len(files)
     projected      = min(100.0, overall + total_issues * 1.5)
 
@@ -256,6 +414,9 @@ def analyze_project_full(input_data: FileAnalysisInput):
         projected_score_after_fixes=round(projected, 1),
         quality_summary=_build_quality_summary(overall, o_label, layer_scores, total_issues, files_violated),
         violation_summary=_build_violation_summary(total_viol, len(files), ap_details),
+        gemini_fallback_used=gemini_fallback_used,
+        quality_adjusted=quality_adjusted,
+        original_overall_score=original_overall,
     )
 
 
@@ -280,13 +441,14 @@ def generate_fix(input_data: SingleFixRequest):
     }
     """
     result = generate_fix_suggestion(
-        anti_pattern  = input_data.anti_pattern,
-        files         = input_data.files,
-        architecture  = input_data.architecture_pattern,
-        layer         = input_data.affected_layer,
-        severity      = input_data.severity,
-        description   = input_data.description,
-        use_gemini    = True,
+        anti_pattern     = input_data.anti_pattern,
+        files            = input_data.files,
+        architecture     = input_data.architecture_pattern,
+        layer            = input_data.affected_layer,
+        severity         = input_data.severity,
+        description      = input_data.description,
+        use_gemini       = True,
+        detection_source = getattr(input_data, 'detection_source', 'ml_model') or 'ml_model',
     )
     return FixSuggestion(**result)
 
@@ -297,8 +459,16 @@ def generate_fixes(input_data: FixRequest):
     Generate AI-powered fix suggestions for ALL violations in a project.
     Falls back to static recommendations if GEMINI_API_KEY is not configured.
     """
+    ap_dicts = []
+    for ap in input_data.anti_patterns:
+        d = ap.dict()
+        # Ensure detection_source propagates to fix generation
+        if not d.get("detection_source"):
+            d["detection_source"] = "ml_model"
+        ap_dicts.append(d)
+
     suggestions_raw = generate_project_fixes(
-        anti_patterns = [ap.dict() for ap in input_data.anti_patterns],
+        anti_patterns = ap_dicts,
         architecture  = input_data.architecture_pattern,
     )
     suggestions = [FixSuggestion(**s) for s in suggestions_raw]

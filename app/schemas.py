@@ -79,13 +79,21 @@ class FileAnalysisInput(BaseModel):
 # ════════════════════════════════════════════════════════════════
 
 class AntiPatternDetail(BaseModel):
-    type           : str
-    severity       : str
-    affected_layer : str
-    confidence     : float
-    files          : List[str]
-    description    : str
-    recommendation : str
+    type             : str
+    severity         : str
+    affected_layer   : str
+    confidence       : float
+    files            : List[str]
+    description      : str
+    recommendation   : str
+    detection_source : Optional[str] = Field(
+        default="ml_model",
+        description="How this anti-pattern was detected: ml_model | gemini_ai | rule_based"
+    )
+    reasoning        : Optional[str] = Field(
+        default=None,
+        description="Explanation when detected by Gemini AI or rule-based fallback"
+    )
 
 
 class EnhancedPredictionResult(BaseModel):
@@ -94,6 +102,10 @@ class EnhancedPredictionResult(BaseModel):
     total_violations      : int
     anti_patterns         : List[AntiPatternDetail]
     summary               : str
+    gemini_fallback_used  : Optional[bool] = Field(
+        default=False,
+        description="True if Gemini AI or rule-based fallback was used for any detection"
+    )
 
 
 # ════════════════════════════════════════════════════════════════
@@ -130,14 +142,22 @@ class QualityScoreResult(BaseModel):
 
 
 class FileQualityResult(BaseModel):
-    file_name       : str
-    file_path       : str
-    layer           : str
-    quality_score   : float
-    quality_label   : str
-    quality_emoji   : str
-    quality_display : str
-    issues          : List[str] = Field(default_factory=list)
+    file_name         : str
+    file_path         : str
+    layer             : str
+    quality_score     : float
+    quality_label     : str
+    quality_emoji     : str
+    quality_display   : str
+    issues            : List[str] = Field(default_factory=list)
+    quality_adjusted  : Optional[bool] = Field(
+        default=False,
+        description="True if quality score was adjusted due to Gemini/rule-based detected patterns"
+    )
+    adjustment_reason : Optional[str] = Field(
+        default=None,
+        description="Explanation of quality score adjustment"
+    )
 
 
 class LayerQualitySummary(BaseModel):
@@ -191,6 +211,18 @@ class CombinedAnalysisResult(BaseModel):
     projected_score_after_fixes : float
     quality_summary       : str
     violation_summary     : str
+    gemini_fallback_used  : Optional[bool] = Field(
+        default=False,
+        description="True if Gemini AI or rule-based fallback was used for any detection"
+    )
+    quality_adjusted      : Optional[bool] = Field(
+        default=False,
+        description="True if quality scores were adjusted due to fallback-detected patterns"
+    )
+    original_overall_score: Optional[float] = Field(
+        default=None,
+        description="Original overall score before Gemini/rule-based adjustment"
+    )
 
 
 # ════════════════════════════════════════════════════════════════
@@ -204,6 +236,10 @@ class SingleFixRequest(BaseModel):
     affected_layer       : str       = "unknown"
     severity             : str       = "MEDIUM"
     description          : str       = ""
+    detection_source     : Optional[str] = Field(
+        default="ml_model",
+        description="How the anti-pattern was detected: ml_model | gemini_ai | rule_based"
+    )
 
 
 class FixRequest(BaseModel):
@@ -212,17 +248,21 @@ class FixRequest(BaseModel):
 
 
 class FixSuggestion(BaseModel):
-    anti_pattern  : str
-    layer         : str
-    severity      : str
-    impact_points : int
-    problem       : str
-    recommendation: str
-    files         : List[str]
-    before_code   : str
-    after_code    : str
-    gemini_fix    : str
-    ai_powered    : bool
+    anti_pattern    : str
+    layer           : str
+    severity        : str
+    impact_points   : int
+    problem         : str
+    recommendation  : str
+    files           : List[str]
+    before_code     : str
+    after_code      : str
+    gemini_fix      : str
+    ai_powered      : bool
+    detection_source: Optional[str] = Field(
+        default="ml_model",
+        description="How the anti-pattern was originally detected: ml_model | gemini_ai | rule_based"
+    )
 
 
 class ProjectFixResult(BaseModel):
