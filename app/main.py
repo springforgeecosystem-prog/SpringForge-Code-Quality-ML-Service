@@ -30,7 +30,7 @@ from collections import defaultdict
 # Load .env file for local development (ignored in production where env vars
 # are set directly in the platform — e.g. Railway, Render, Docker).
 from dotenv import load_dotenv
-load_dotenv()
+load_dotenv(override=True)
 
 from fastapi import FastAPI, HTTPException
 

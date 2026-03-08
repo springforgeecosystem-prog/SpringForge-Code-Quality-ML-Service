@@ -30,7 +30,16 @@ import traceback
 import requests as http_requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-GEMINI_API_KEY = "AIzaSyA1CH7Gz6IYTg4gFr0EVAhRW6o-72VbNfQ"
+
+def _get_api_key() -> str:
+    """Read GEMINI_API_KEY from os.environ at call time (not import time).
+
+    This avoids the stale-constant problem: Docker injects env vars before
+    the process starts, and locally load_dotenv() in main.py populates
+    os.environ before the first request arrives.
+    """
+    return os.environ.get("GEMINI_API_KEY", "")
+
 
 # FIX 1: Use gemini-2.5-flash as default — stable and available.
 # Override with GEMINI_MODEL env variable if you want a different model.
@@ -470,16 +479,18 @@ try {
 def _call_gemini(prompt: str) -> str:
     """Call Gemini API. Returns empty string on any failure."""
     
+    api_key = _get_api_key()
+
     # ── DETAILED DIAGNOSTICS ──────────────────────────────────────
     print(f"\n  [Gemini] ── _call_gemini() called ──")
-    print(f"  [Gemini] API key set  : {bool(GEMINI_API_KEY)}")
-    print(f"  [Gemini] Key prefix   : {GEMINI_API_KEY[:8] if GEMINI_API_KEY else 'NONE'}...")
+    print(f"  [Gemini] API key set  : {bool(api_key)}")
+    print(f"  [Gemini] Key prefix   : {api_key[:8] if api_key else 'NONE'}...")
     print(f"  [Gemini] Model        : {GEMINI_MODEL}")
     print(f"  [Gemini] URL          : {GEMINI_API_URL}")
     print(f"  [Gemini] Prompt chars : {len(prompt)}")
     # ─────────────────────────────────────────────────────────────
 
-    if not GEMINI_API_KEY:
+    if not api_key:
         print("  [Gemini] ❌ Skipped — GEMINI_API_KEY not set.")
         return ""
     try:
@@ -493,7 +504,7 @@ def _call_gemini(prompt: str) -> str:
         }
         print(f"  [Gemini] Sending POST request (timeout={GEMINI_TIMEOUT}s)...")
         resp = http_requests.post(
-            f"{GEMINI_API_URL}?key={GEMINI_API_KEY}",
+            f"{GEMINI_API_URL}?key={api_key}",
             json=payload,
             timeout=GEMINI_TIMEOUT,
         )
